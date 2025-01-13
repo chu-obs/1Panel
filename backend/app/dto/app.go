@@ -37,8 +37,9 @@ type AppOssConfig struct {
 }
 
 type AppVersion struct {
-	Version  string `json:"version"`
-	DetailId uint   `json:"detailId"`
+	Version       string `json:"version"`
+	DetailId      uint   `json:"detailId"`
+	DockerCompose string `json:"dockerCompose"`
 }
 
 type AppList struct {
@@ -91,6 +92,7 @@ type AppProperty struct {
 	Website            string   `json:"website"`
 	Github             string   `json:"github"`
 	Document           string   `json:"document"`
+	Version            float64  `json:"version"`
 }
 
 type AppConfigVersion struct {
@@ -108,7 +110,8 @@ type Tag struct {
 }
 
 type AppForm struct {
-	FormFields []AppFormFields `json:"formFields"`
+	FormFields     []AppFormFields `json:"formFields"`
+	SupportVersion float64         `json:"supportVersion"`
 }
 
 type AppFormFields struct {

@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -26,6 +25,8 @@ import (
 	"github.com/1Panel-dev/1Panel/backend/utils/docker"
 	"github.com/1Panel-dev/1Panel/backend/utils/files"
 	http2 "github.com/1Panel-dev/1Panel/backend/utils/http"
+	httpUtil "github.com/1Panel-dev/1Panel/backend/utils/http"
+	"github.com/1Panel-dev/1Panel/backend/utils/xpack"
 	"gopkg.in/yaml.v3"
 )
 
@@ -88,14 +89,18 @@ func (a AppService) PageApp(req request.AppSearch) (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	var appDTOs []*response.AppDTO
+	var appDTOs []*response.AppItem
 	for _, ap := range apps {
-		ap.ReadMe = ""
-		ap.Website = ""
-		ap.Document = ""
-		ap.Github = ""
-		appDTO := &response.AppDTO{
-			App: ap,
+		appDTO := &response.AppItem{
+			ID:          ap.ID,
+			Name:        ap.Name,
+			Key:         ap.Key,
+			Type:        ap.Type,
+			Icon:        ap.Icon,
+			ShortDescZh: ap.ShortDescZh,
+			ShortDescEn: ap.ShortDescEn,
+			Resource:    ap.Resource,
+			Limit:       ap.Limit,
 		}
 		appDTOs = append(appDTOs, appDTO)
 		appTags, err := appTagRepo.GetByAppId(ap.ID)
@@ -121,11 +126,8 @@ func (a AppService) PageApp(req request.AppSearch) (interface{}, error) {
 }
 
 func (a AppService) GetAppTags() ([]response.TagDTO, error) {
-	tags, err := tagRepo.All()
-	if err != nil {
-		return nil, err
-	}
-	var res []response.TagDTO
+	tags, _ := tagRepo.All()
+	res := make([]response.TagDTO, 0)
 	for _, tag := range tags {
 		res = append(res, response.TagDTO{
 			Tag: tag,
@@ -136,6 +138,9 @@ func (a AppService) GetAppTags() ([]response.TagDTO, error) {
 
 func (a AppService) GetApp(key string) (*response.AppDTO, error) {
 	var appDTO response.AppDTO
+	if key == "postgres" {
+		key = "postgresql"
+	}
 	app, err := appRepo.GetFirst(appRepo.WithKey(key))
 	if err != nil {
 		return nil, err
@@ -176,7 +181,7 @@ func (a AppService) GetAppDetail(appID uint, version, appType string) (response.
 
 		versionPath := filepath.Join(app.GetAppResourcePath(), detail.Version)
 		if !fileOp.Stat(versionPath) || detail.Update {
-			if err = downloadApp(app, detail, nil); err != nil {
+			if err = downloadApp(app, detail, nil); err != nil && !fileOp.Stat(versionPath) {
 				return appDetailDTO, err
 			}
 		}
@@ -226,20 +231,16 @@ func (a AppService) GetAppDetail(appID uint, version, appType string) (response.
 	if appDetailDTO.DockerCompose == "" {
 		filename := filepath.Base(appDetailDTO.DownloadUrl)
 		dockerComposeUrl := fmt.Sprintf("%s%s", strings.TrimSuffix(appDetailDTO.DownloadUrl, filename), "docker-compose.yml")
-		composeRes, err := http.Get(dockerComposeUrl)
+		statusCode, composeRes, err := httpUtil.HandleGet(dockerComposeUrl, http.MethodGet, constant.TimeOut20s)
 		if err != nil {
 			return appDetailDTO, buserr.WithDetail("ErrGetCompose", err.Error(), err)
 		}
-		bodyContent, err := io.ReadAll(composeRes.Body)
-		if err != nil {
-			return appDetailDTO, buserr.WithDetail("ErrGetCompose", err.Error(), err)
+		if statusCode > 200 {
+			return appDetailDTO, buserr.WithDetail("ErrGetCompose", string(composeRes), err)
 		}
-		if composeRes.StatusCode > 200 {
-			return appDetailDTO, buserr.WithDetail("ErrGetCompose", string(bodyContent), err)
-		}
-		detail.DockerCompose = string(bodyContent)
+		detail.DockerCompose = string(composeRes)
 		_ = appDetailRepo.Update(context.Background(), detail)
-		appDetailDTO.DockerCompose = string(bodyContent)
+		appDetailDTO.DockerCompose = string(composeRes)
 	}
 
 	appDetailDTO.HostMode = isHostModel(appDetailDTO.DockerCompose)
@@ -362,7 +363,7 @@ func (a AppService) Install(ctx context.Context, req request.AppInstallCreate) (
 	}
 
 	value, ok := composeMap["services"]
-	if !ok {
+	if !ok || value == nil {
 		err = buserr.New(constant.ErrFileParse)
 		return
 	}
@@ -439,6 +440,7 @@ func (a AppService) Install(ctx context.Context, req request.AppInstallCreate) (
 		return
 	}
 	appInstall.Env = string(paramByte)
+
 	if err = appInstallRepo.Create(ctx, appInstall); err != nil {
 		return
 	}
@@ -448,7 +450,7 @@ func (a AppService) Install(ctx context.Context, req request.AppInstallCreate) (
 	go func() {
 		defer func() {
 			if err != nil {
-				appInstall.Status = constant.Error
+				appInstall.Status = constant.UpErr
 				appInstall.Message = err.Error()
 				_ = appInstallRepo.Save(context.Background(), appInstall)
 			}
@@ -698,16 +700,11 @@ func (a AppService) GetAppUpdate() (*response.AppUpdateRes, error) {
 	}
 
 	versionUrl := fmt.Sprintf("%s/%s/1panel.json.version.txt", global.CONF.System.AppRepo, global.CONF.System.Mode)
-	versionRes, err := http2.GetHttpRes(versionUrl)
+	_, versionRes, err := http2.HandleGet(versionUrl, http.MethodGet, constant.TimeOut20s)
 	if err != nil {
 		return nil, err
 	}
-	defer versionRes.Body.Close()
-	body, err := io.ReadAll(versionRes.Body)
-	if err != nil {
-		return nil, err
-	}
-	lastModifiedStr := string(body)
+	lastModifiedStr := string(versionRes)
 	lastModified, err := strconv.Atoi(lastModifiedStr)
 	if err != nil {
 		return nil, err
@@ -727,6 +724,14 @@ func (a AppService) GetAppUpdate() (*response.AppUpdateRes, error) {
 		res.CanUpdate = true
 		return res, err
 	}
+	apps, _ := appRepo.GetBy(appRepo.WithResource(constant.AppResourceRemote))
+	for _, app := range apps {
+		if app.Icon == "" {
+			res.CanUpdate = true
+			return res, err
+		}
+	}
+
 	list, err := getAppList()
 	if err != nil {
 		return res, err
@@ -744,10 +749,10 @@ func getAppFromRepo(downloadPath string) error {
 	global.LOG.Infof("[AppStore] download file from %s", downloadUrl)
 	fileOp := files.NewFileOp()
 	packagePath := filepath.Join(constant.ResourceDir, filepath.Base(downloadUrl))
-	if err := fileOp.DownloadFile(downloadUrl, packagePath); err != nil {
+	if err := fileOp.DownloadFileWithProxy(downloadUrl, packagePath); err != nil {
 		return err
 	}
-	if err := fileOp.Decompress(packagePath, constant.ResourceDir, files.SdkZip); err != nil {
+	if err := fileOp.Decompress(packagePath, constant.ResourceDir, files.SdkZip, ""); err != nil {
 		return err
 	}
 	defer func() {
@@ -805,6 +810,17 @@ func (a AppService) SyncAppListFromRemote() (err error) {
 	settingService := NewISettingService()
 	_ = settingService.Update("AppStoreSyncStatus", constant.Syncing)
 
+	defer func() {
+		if err != nil {
+			_ = settingService.Update("AppStoreSyncStatus", constant.SyncFailed)
+			global.LOG.Errorf("App Store synchronization failed %v", err)
+		}
+	}()
+
+	setting, err := settingService.GetSettingInfo()
+	if err != nil {
+		return err
+	}
 	var (
 		tags      []*model.Tag
 		appTags   []*model.AppTag
@@ -825,21 +841,28 @@ func (a AppService) SyncAppListFromRemote() (err error) {
 		oldAppIds = append(oldAppIds, old.ID)
 	}
 
+	transport := xpack.LoadRequestTransport()
 	baseRemoteUrl := fmt.Sprintf("%s/%s/1panel", global.CONF.System.AppRepo, global.CONF.System.Mode)
 	appsMap := getApps(oldApps, list.Apps)
 
 	global.LOG.Infof("Starting synchronization of application details...")
 	for _, l := range list.Apps {
 		app := appsMap[l.AppProperty.Key]
-		iconRes, err := http.Get(l.Icon)
+
+		if l.AppProperty.Version > 0 && common.CompareVersion(strconv.FormatFloat(l.AppProperty.Version, 'f', -1, 64), setting.SystemVersion) {
+			delete(appsMap, l.AppProperty.Key)
+			continue
+		}
+
+		_, iconRes, err := httpUtil.HandleGetWithTransport(l.Icon, http.MethodGet, transport, constant.TimeOut20s)
 		if err != nil {
 			return err
 		}
-		body, err := io.ReadAll(iconRes.Body)
-		if err != nil {
-			return err
+		iconStr := ""
+		if !strings.Contains(string(iconRes), "<xml>") {
+			iconStr = base64.StdEncoding.EncodeToString(iconRes)
 		}
-		iconStr := base64.StdEncoding.EncodeToString(body)
+
 		app.Icon = iconStr
 		app.TagsKey = l.AppProperty.Tags
 		if l.AppProperty.Recommend > 0 {
@@ -855,23 +878,24 @@ func (a AppService) SyncAppListFromRemote() (err error) {
 			version := v.Name
 			detail := detailsMap[version]
 			versionUrl := fmt.Sprintf("%s/%s/%s", baseRemoteUrl, app.Key, version)
-
+			paramByte, _ := json.Marshal(v.AppForm)
+			var appForm dto.AppForm
+			_ = json.Unmarshal(paramByte, &appForm)
+			if appForm.SupportVersion > 0 && common.CompareVersion(strconv.FormatFloat(appForm.SupportVersion, 'f', -1, 64), setting.SystemVersion) {
+				delete(detailsMap, version)
+				continue
+			}
 			if _, ok := InitTypes[app.Type]; ok {
 				dockerComposeUrl := fmt.Sprintf("%s/%s", versionUrl, "docker-compose.yml")
-				composeRes, err := http.Get(dockerComposeUrl)
+				_, composeRes, err := httpUtil.HandleGetWithTransport(dockerComposeUrl, http.MethodGet, transport, constant.TimeOut20s)
 				if err != nil {
 					return err
 				}
-				bodyContent, err := io.ReadAll(composeRes.Body)
-				if err != nil {
-					return err
-				}
-				detail.DockerCompose = string(bodyContent)
+				detail.DockerCompose = string(composeRes)
 			} else {
 				detail.DockerCompose = ""
 			}
 
-			paramByte, _ := json.Marshal(v.AppForm)
 			detail.Params = string(paramByte)
 			detail.DownloadUrl = fmt.Sprintf("%s/%s", versionUrl, app.Key+"-"+version+".tar.gz")
 			detail.DownloadCallBackUrl = v.DownloadCallBackUrl
